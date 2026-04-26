@@ -8,7 +8,7 @@
 #include <atomic>
 #include <mutex>
 #include <deque>
-#include "../include/TitanShift.h"
+#include "TitanShift.h"
 
 #pragma comment(lib, "pdh.lib")
 #pragma comment(lib, "psapi.lib")

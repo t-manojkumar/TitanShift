@@ -12,8 +12,8 @@
 #include <queue>
 #include <sstream>
 #include <iomanip>
-#include "../include/FileEngine.h"
-#include "../include/TitanShift.h"
+#include "FileEngine.h"
+#include "TitanShift.h"
 
 #pragma comment(lib, "shlwapi.lib")
 

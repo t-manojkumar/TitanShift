@@ -7,7 +7,7 @@
 #include <vector>
 #include <atomic>
 #include <functional>
-#include "../include/TitanShift.h"
+#include "TitanShift.h"
 
 /*
  * FileEngine — Windows-native high-performance file operations

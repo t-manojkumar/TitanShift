@@ -13,9 +13,9 @@
 #include <sstream>
 #include <iomanip>
 #include <algorithm>
-#include "../include/TitanShift.h"
-#include "../include/FileEngine.h"
-#include "../include/MetricsEngine.h"
+#include "TitanShift.h"
+#include "FileEngine.h"
+#include "MetricsEngine.h"
 
 static const wchar_t* CLASS_NAME = L"TitanShiftWnd";
 

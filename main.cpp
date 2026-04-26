@@ -49,11 +49,11 @@
 #pragma comment(lib, "psapi.lib")
 #pragma comment(lib, "ntdll.lib")
 
-#include "../include/TitanShift.h"
-#include "../include/FileEngine.h"
-#include "../include/MetricsEngine.h"
-#include "../include/Renderer.h"
-#include "../include/UIComponents.h"
+#include "TitanShift.h"
+#include "FileEngine.h"
+#include "MetricsEngine.h"
+
+
 
 // Global application instance
 TitanShiftApp* g_App = nullptr;
