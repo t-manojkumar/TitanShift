@@ -1,44 +1,36 @@
-#define WIN32_LEAN_AND_MEAN
-#define NOMINMAX
-#define UNICODE
-#include <windows.h>
-#include <windowsx.h>
-#include <shlobj.h>
-#include <shlwapi.h>
-#include <d2d1.h>
-#include <dwrite.h>
-#include <math.h>
-#include <string>
-#include <vector>
-#include <sstream>
-#include <iomanip>
-#include <algorithm>
 #include "TitanShift.h"
 #include "FileEngine.h"
 #include "MetricsEngine.h"
 
+#include <windowsx.h>
+#include <shlobj.h>
+#include <shlwapi.h>
+#include <math.h>
+#include <string>
+#include <vector>
+#include <algorithm>
+
 static const wchar_t* CLASS_NAME = L"TitanShiftWnd";
 
-// ─────────────────────────────────────────────────────────────────
-// Constructor / Destructor
+// Shared op-state (single concurrent operation)
+static std::atomic<bool> s_cancel{false};
+static std::atomic<bool> s_pause{false};
+static OpStats s_stats;
+
 // ─────────────────────────────────────────────────────────────────
 TitanShiftApp::TitanShiftApp(HINSTANCE hInst) : m_hInst(hInst) {
-    // Zero init buttons
     for (int i = 0; i < BTN_COUNT; i++) {
         m_buttons[i].id      = (BtnID)i;
         m_buttons[i].enabled = true;
         m_buttons[i].active  = false;
     }
-    m_buttons[BTN_MODE_COPY].active  = true;
+    m_buttons[BTN_MODE_COPY].active     = true;
     m_buttons[BTN_OPT_OVERWRITE].active = true;
     m_buttons[BTN_OPT_PRESERVE].active  = true;
 }
 
 TitanShiftApp::~TitanShiftApp() { Cleanup(); }
 
-// ─────────────────────────────────────────────────────────────────
-// Run
-// ─────────────────────────────────────────────────────────────────
 int TitanShiftApp::Run(int nCmdShow) {
     if (!InitWindow()) return 1;
     if (!InitD2D())    return 1;
@@ -46,7 +38,6 @@ int TitanShiftApp::Run(int nCmdShow) {
     CreateFonts();
     UpdateButtonLayout();
 
-    // Start metrics engine
     m_metricsEngine = std::make_unique<MetricsEngine>(m_hwnd);
     m_metricsEngine->Start();
 
@@ -61,9 +52,6 @@ int TitanShiftApp::Run(int nCmdShow) {
     return (int)msg.wParam;
 }
 
-// ─────────────────────────────────────────────────────────────────
-// Window init
-// ─────────────────────────────────────────────────────────────────
 bool TitanShiftApp::InitWindow() {
     WNDCLASSEXW wc{};
     wc.cbSize        = sizeof(wc);
@@ -75,7 +63,6 @@ bool TitanShiftApp::InitWindow() {
     wc.lpszClassName = CLASS_NAME;
     if (!RegisterClassExW(&wc)) return false;
 
-    // Get DPI for primary monitor
     HDC hdc = GetDC(nullptr);
     m_dpi   = (float)GetDeviceCaps(hdc, LOGPIXELSX);
     ReleaseDC(nullptr, hdc);
@@ -87,7 +74,7 @@ bool TitanShiftApp::InitWindow() {
     m_hwnd = CreateWindowExW(
         WS_EX_APPWINDOW,
         CLASS_NAME, L"TitanShift",
-        WS_POPUP | WS_THICKFRAME | WS_MINIMIZEBOX | WS_MAXIMIZEBOX,
+        WS_OVERLAPPEDWINDOW,
         (GetSystemMetrics(SM_CXSCREEN) - W) / 2,
         (GetSystemMetrics(SM_CYSCREEN) - H) / 2,
         W, H, nullptr, nullptr, m_hInst, this
@@ -95,23 +82,16 @@ bool TitanShiftApp::InitWindow() {
     return m_hwnd != nullptr;
 }
 
-// ─────────────────────────────────────────────────────────────────
-// Direct2D init
-// ─────────────────────────────────────────────────────────────────
 bool TitanShiftApp::InitD2D() {
-    HRESULT hr = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, &m_d2dFactory);
-    if (FAILED(hr)) return false;
-
-    hr = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED,
-        __uuidof(IDWriteFactory), reinterpret_cast<IUnknown**>(&m_dwFactory));
-    if (FAILED(hr)) return false;
-
+    if (FAILED(D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, &m_d2dFactory))) return false;
+    if (FAILED(DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED,
+        __uuidof(IDWriteFactory), reinterpret_cast<IUnknown**>(&m_dwFactory)))) return false;
     RecreateTarget();
     return true;
 }
 
 void TitanShiftApp::RecreateTarget() {
-    if (m_rt) { m_rt->Release(); m_rt = nullptr; }
+    if (m_rt)    { m_rt->Release();    m_rt    = nullptr; }
     if (m_brush) { m_brush->Release(); m_brush = nullptr; }
 
     RECT rc; GetClientRect(m_hwnd, &rc);
@@ -128,20 +108,12 @@ void TitanShiftApp::RecreateTarget() {
     if (m_rt) m_rt->CreateSolidColorBrush(D2D1::ColorF(1,1,1), &m_brush);
 }
 
-// ─────────────────────────────────────────────────────────────────
-// Fonts
-// ─────────────────────────────────────────────────────────────────
 void TitanShiftApp::CreateFonts() {
     if (!m_dwFactory) return;
     struct FDef { float pt; bool bold; bool mono; };
     FDef defs[FONT_COUNT] = {
-        {9,  false, true },  // FONT_MONO_SM
-        {11, false, true },  // FONT_MONO_MD
-        {14, false, true },  // FONT_MONO_LG
-        {20, true,  true },  // FONT_MONO_XL
-        {9,  false, false},  // FONT_UI_SM
-        {11, false, false},  // FONT_UI_MD
-        {13, true,  false},  // FONT_UI_LG
+        {9, false, true}, {11, false, true}, {14, false, true}, {20, true, true},
+        {9, false, false}, {11, false, false}, {13, true, false},
     };
     for (int i = 0; i < FONT_COUNT; i++) {
         const wchar_t* face = defs[i].mono ? L"Consolas" : L"Segoe UI";
@@ -149,16 +121,13 @@ void TitanShiftApp::CreateFonts() {
         m_dwFactory->CreateTextFormat(face, nullptr, wt,
             DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL,
             defs[i].pt * m_scale, L"en-US", &m_fonts[i]);
-        if (m_fonts[i]) {
-            m_fonts[i]->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
-        }
+        if (m_fonts[i]) m_fonts[i]->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
     }
 }
 
 void TitanShiftApp::Cleanup() {
     if (m_metricsEngine) m_metricsEngine->Stop();
     if (m_workerThread.joinable()) m_workerThread.join();
-    if (m_metricsThread.joinable()) m_metricsThread.join();
 
     for (auto& f : m_fonts) if (f) { f->Release(); f = nullptr; }
     if (m_brush)     { m_brush->Release();     m_brush     = nullptr; }
@@ -167,9 +136,6 @@ void TitanShiftApp::Cleanup() {
     if (m_d2dFactory){ m_d2dFactory->Release(); m_d2dFactory= nullptr; }
 }
 
-// ─────────────────────────────────────────────────────────────────
-// WndProc
-// ─────────────────────────────────────────────────────────────────
 LRESULT CALLBACK TitanShiftApp::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     TitanShiftApp* app = nullptr;
     if (msg == WM_NCCREATE) {
@@ -184,9 +150,6 @@ LRESULT CALLBACK TitanShiftApp::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM l
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
 
-// ─────────────────────────────────────────────────────────────────
-// HandleMessage
-// ─────────────────────────────────────────────────────────────────
 LRESULT TitanShiftApp::HandleMessage(UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
     case WM_PAINT: {
@@ -199,34 +162,17 @@ LRESULT TitanShiftApp::HandleMessage(UINT msg, WPARAM wp, LPARAM lp) {
     case WM_SIZE:
         OnResize(LOWORD(lp), HIWORD(lp));
         return 0;
-
     case WM_DPICHANGED:
         OnDpiChanged(HIWORD(wp), reinterpret_cast<RECT*>(lp));
         return 0;
+    case WM_LBUTTONDOWN: OnLButtonDown(GET_X_LPARAM(lp), GET_Y_LPARAM(lp)); return 0;
+    case WM_LBUTTONUP:   OnLButtonUp(GET_X_LPARAM(lp), GET_Y_LPARAM(lp));   return 0;
+    case WM_MOUSEMOVE:   OnMouseMove(GET_X_LPARAM(lp), GET_Y_LPARAM(lp));   return 0;
+    case WM_MOUSELEAVE:  OnMouseLeave(); return 0;
+    case WM_MOUSEWHEEL:  OnMouseWheel(GET_WHEEL_DELTA_WPARAM(wp), GET_X_LPARAM(lp), GET_Y_LPARAM(lp)); return 0;
+    case WM_CHAR:        OnChar((wchar_t)wp); return 0;
+    case WM_KEYDOWN:     OnKeyDown(wp); return 0;
 
-    case WM_LBUTTONDOWN:
-        OnLButtonDown(GET_X_LPARAM(lp), GET_Y_LPARAM(lp));
-        return 0;
-    case WM_LBUTTONUP:
-        OnLButtonUp(GET_X_LPARAM(lp), GET_Y_LPARAM(lp));
-        return 0;
-    case WM_MOUSEMOVE:
-        OnMouseMove(GET_X_LPARAM(lp), GET_Y_LPARAM(lp));
-        return 0;
-    case WM_MOUSELEAVE:
-        OnMouseLeave();
-        return 0;
-    case WM_MOUSEWHEEL:
-        OnMouseWheel(GET_WHEEL_DELTA_WPARAM(wp), GET_X_LPARAM(lp), GET_Y_LPARAM(lp));
-        return 0;
-    case WM_CHAR:
-        OnChar((wchar_t)wp);
-        return 0;
-    case WM_KEYDOWN:
-        OnKeyDown(wp);
-        return 0;
-
-    // Custom messages from worker threads
     case WM_METRICS_UPDATE: {
         if (m_metricsEngine) {
             std::lock_guard<std::mutex> lk(m_metricsMutex);
@@ -236,8 +182,6 @@ LRESULT TitanShiftApp::HandleMessage(UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
     case WM_PROGRESS_UPDATE:
-        InvalidateRect(m_hwnd, nullptr, FALSE);
-        return 0;
     case WM_LOG_APPEND:
         InvalidateRect(m_hwnd, nullptr, FALSE);
         return 0;
@@ -246,47 +190,29 @@ LRESULT TitanShiftApp::HandleMessage(UINT msg, WPARAM wp, LPARAM lp) {
         m_lastProgress.state = OpState::DONE;
         m_lastProgress.pct   = 100;
         PostLog(LogLevel::SUCCESS, L"Operation completed successfully.");
+        UpdateButtonLayout();
         InvalidateRect(m_hwnd, nullptr, FALSE);
         return 0;
     }
     case WM_OP_ERROR: {
-        m_opState = OpState::ERROR;
-        m_lastProgress.state = OpState::ERROR;
+        m_opState = OpState::ERR_STATE;
+        m_lastProgress.state = OpState::ERR_STATE;
+        UpdateButtonLayout();
         InvalidateRect(m_hwnd, nullptr, FALSE);
         return 0;
     }
-
-    // Hit-test for custom titlebar (allows resize + move)
-    case WM_NCHITTEST: {
-        LRESULT def = DefWindowProcW(m_hwnd, msg, wp, lp);
-        if (def == HTCLIENT) {
-            POINT pt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
-            ScreenToClient(m_hwnd, &pt);
-            float tb = S(32.f);
-            if (pt.y < tb) return HTCAPTION;
-        }
-        return def;
-    }
-
     case WM_GETMINMAXINFO: {
         auto* mmi = reinterpret_cast<MINMAXINFO*>(lp);
-        mmi->ptMinTrackSize = { (LONG)(800 * m_scale), (LONG)(600 * m_scale) };
+        mmi->ptMinTrackSize.x = (LONG)(900 * m_scale);
+        mmi->ptMinTrackSize.y = (LONG)(620 * m_scale);
         return 0;
     }
-
-    case WM_ERASEBKGND:
-        return 1; // prevent flicker
-
-    case WM_DESTROY:
-        PostQuitMessage(0);
-        return 0;
+    case WM_ERASEBKGND: return 1;
+    case WM_DESTROY: PostQuitMessage(0); return 0;
     }
     return DefWindowProcW(m_hwnd, msg, wp, lp);
 }
 
-// ─────────────────────────────────────────────────────────────────
-// Resize / DPI
-// ─────────────────────────────────────────────────────────────────
 void TitanShiftApp::OnResize(int w, int h) {
     if (m_rt) m_rt->Resize({(UINT32)w, (UINT32)h});
     m_size = {(float)w, (float)h};
@@ -306,9 +232,6 @@ void TitanShiftApp::OnDpiChanged(int dpi, RECT* r) {
     InvalidateRect(m_hwnd, nullptr, FALSE);
 }
 
-// ─────────────────────────────────────────────────────────────────
-// PostProgress (called from worker thread)
-// ─────────────────────────────────────────────────────────────────
 void TitanShiftApp::PostProgress(const ProgressPayload& p) {
     {
         std::lock_guard<std::mutex> lk(m_progressMutex);
@@ -335,7 +258,7 @@ void TitanShiftApp::PostComplete() { PostMessageW(m_hwnd, WM_OP_COMPLETE, 0, 0);
 void TitanShiftApp::PostError(const std::wstring&) { PostMessageW(m_hwnd, WM_OP_ERROR, 0, 0); }
 
 // ─────────────────────────────────────────────────────────────────
-// Button layout
+// Layout
 // ─────────────────────────────────────────────────────────────────
 void TitanShiftApp::UpdateButtonLayout() {
     RECT rc; GetClientRect(m_hwnd, &rc);
@@ -343,65 +266,53 @@ void TitanShiftApp::UpdateButtonLayout() {
     float H = (float)(rc.bottom - rc.top);
     m_size  = {W, H};
 
-    const float TB  = S(32.f);    // titlebar height
-    const float LP  = S(320.f);   // left panel width
+    const float TB  = S(36.f);
+    const float LP  = S(320.f);
     const float PAD = S(12.f);
-    const float BTH = S(26.f);    // button height
+    const float BTH = S(26.f);
 
-    // Win controls
-    float bx = W - S(44.f);
-    m_buttons[BTN_WIN_CLOSE].rect = R(bx, 0, S(44.f), TB); bx -= S(44.f);
-    m_buttons[BTN_WIN_MAX].rect   = R(bx, 0, S(44.f), TB); bx -= S(44.f);
-    m_buttons[BTN_WIN_MIN].rect   = R(bx, 0, S(44.f), TB);
+    // Window controls (hidden — using OS title bar)
+    m_buttons[BTN_WIN_MIN].rect   = R(0,0,0,0);
+    m_buttons[BTN_WIN_MAX].rect   = R(0,0,0,0);
+    m_buttons[BTN_WIN_CLOSE].rect = R(0,0,0,0);
 
-    // Mode buttons (left panel, below titlebar)
     float mx = PAD, my = TB + PAD;
     float mw = (LP - PAD*2 - S(4.f)*5) / 6.f;
     BtnID modes[] = {BTN_MODE_COPY, BTN_MODE_MOVE, BTN_MODE_RENAME,
                      BTN_MODE_DELETE, BTN_MODE_DEDUPE, BTN_MODE_SYNC};
-    for (int i = 0; i < 6; i++) {
+    for (int i = 0; i < 6; i++)
         m_buttons[modes[i]].rect = R(mx + i*(mw + S(4.f)), my, mw, BTH);
-    }
 
-    // Source buttons
-    float sy = my + BTH + S(60.f) + S(8.f) + S(100.f) + S(8.f);
+    float sy = my + BTH + S(20.f) + S(50.f) + S(8.f) + S(90.f) + S(8.f);
     m_buttons[BTN_ADD_FILES].rect  = R(PAD,          sy, S(70.f), BTH);
     m_buttons[BTN_ADD_FOLDER].rect = R(PAD+S(74.f),  sy, S(70.f), BTH);
     m_buttons[BTN_CLEAR_SRC].rect  = R(PAD+S(148.f), sy, S(60.f), BTH);
 
-    // Dest button
-    float dy = sy + BTH + S(8.f) + BTH + S(8.f);
+    float dy = sy + BTH + S(20.f) + BTH + S(8.f);
     m_buttons[BTN_PICK_DEST].rect = R(LP - PAD - S(60.f), dy, S(60.f), BTH);
 
-    // Options
-    float oy = dy + BTH + S(8.f);
+    float oy = dy + BTH + S(20.f);
     m_buttons[BTN_OPT_OVERWRITE].rect = R(PAD,          oy, S(88.f), BTH);
     m_buttons[BTN_OPT_VERIFY].rect    = R(PAD+S(92.f),  oy, S(68.f), BTH);
     m_buttons[BTN_OPT_PRESERVE].rect  = R(PAD+S(164.f), oy, S(88.f), BTH);
+    m_buttons[BTN_OPT_THREADS].rect   = R(PAD + S(256.f), oy, S(44.f), BTH);
 
-    // Thread count
-    m_buttons[BTN_OPT_THREADS].rect = R(PAD + S(256.f), oy, S(44.f), BTH);
-
-    // Run button
     float ry = oy + BTH + S(8.f);
     m_buttons[BTN_RUN].rect = R(PAD, ry, LP - PAD*2, S(36.f));
 
-    // Cancel / Pause (right panel)
-    float rp = LP + S(1.f); // right panel x
+    float rp = LP + S(1.f);
     float pw = W - rp;
-    float cy2 = TB + PAD + S(36.f) + S(8.f);
+    float cy2 = TB + PAD + S(14.f) + S(78.f);
     float bw2 = (pw - PAD*2 - S(8.f)) / 2.f;
-    m_buttons[BTN_CANCEL].rect = R(rp + PAD,        cy2 + S(68.f), bw2, BTH);
-    m_buttons[BTN_PAUSE].rect  = R(rp + PAD + bw2 + S(8.f), cy2 + S(68.f), bw2, BTH);
+    m_buttons[BTN_CANCEL].rect = R(rp + PAD,                    cy2, bw2, BTH);
+    m_buttons[BTN_PAUSE].rect  = R(rp + PAD + bw2 + S(8.f),     cy2, bw2, BTH);
 
-    // Clear log
-    m_buttons[BTN_CLEAR_LOG].rect = R(PAD, H - S(14.f) - BTH, S(60.f), BTH);
+    m_buttons[BTN_CLEAR_LOG].rect = R(LP - PAD - S(50.f),
+                                        ry + S(36.f) + S(14.f), S(50.f), S(14.f));
 
-    // Mark danger buttons
     m_buttons[BTN_MODE_DELETE].danger = true;
     m_buttons[BTN_CANCEL].danger      = true;
 
-    // Disable controls based on state
     bool running = (m_opState == OpState::RUNNING || m_opState == OpState::PAUSED
                  || m_opState == OpState::SCANNING);
     m_buttons[BTN_RUN].enabled    = !running;
@@ -422,93 +333,79 @@ void TitanShiftApp::DrawRect(D2D1_RECT_F r, D2D1_COLOR_F fill, D2D1_COLOR_F stro
     if (sw > 0.f && stroke.a > 0.f) { SetBrushColor(stroke); m_rt->DrawRectangle(r, m_brush, sw); }
 }
 
-void TitanShiftApp::DrawRoundRect(D2D1_RECT_F r, float radius, D2D1_COLOR_F fill, D2D1_COLOR_F stroke, float sw) {
+void TitanShiftApp::DrawRoundRect(D2D1_RECT_F r, float radius, D2D1_COLOR_F fill,
+                                   D2D1_COLOR_F stroke, float sw) {
     if (!m_rt || !m_brush) return;
     D2D1_ROUNDED_RECT rr{ r, radius, radius };
-    if (fill.a > 0.f)     { SetBrushColor(fill);   m_rt->FillRoundedRectangle(rr, m_brush); }
+    if (fill.a > 0.f)               { SetBrushColor(fill);   m_rt->FillRoundedRectangle(rr, m_brush); }
     if (sw > 0.f && stroke.a > 0.f) { SetBrushColor(stroke); m_rt->DrawRoundedRectangle(rr, m_brush, sw); }
 }
 
-void TitanShiftApp::DrawLine(float x1, float y1, float x2, float y2, D2D1_COLOR_F col, float w) {
+void TitanShiftApp::DrawLineSeg(float x1, float y1, float x2, float y2,
+                                 D2D1_COLOR_F col, float w) {
     if (!m_rt || !m_brush) return;
     SetBrushColor(col);
     m_rt->DrawLine({x1,y1}, {x2,y2}, m_brush, w);
 }
 
-void TitanShiftApp::DrawText(const wchar_t* t, D2D1_RECT_F r, FontID fid,
-                              D2D1_COLOR_F col,
-                              DWRITE_TEXT_ALIGNMENT ha,
-                              DWRITE_PARAGRAPH_ALIGNMENT va) {
+void TitanShiftApp::DrawTextEx(const wchar_t* t, D2D1_RECT_F r, FontID fid,
+                                D2D1_COLOR_F col,
+                                DWRITE_TEXT_ALIGNMENT ha,
+                                DWRITE_PARAGRAPH_ALIGNMENT va) {
     if (!m_rt || !m_brush || !m_fonts[fid] || !t) return;
     IDWriteTextFormat* fmt = m_fonts[fid];
     fmt->SetTextAlignment(ha);
     fmt->SetParagraphAlignment(va);
     SetBrushColor(col);
-    m_rt->DrawTextW(t, (UINT32)wcslen(t), fmt, r, m_brush,
-        D2D1_DRAW_TEXT_OPTIONS_CLIP);
+    m_rt->DrawTextW(t, (UINT32)wcslen(t), fmt, r, m_brush, D2D1_DRAW_TEXT_OPTIONS_CLIP);
 }
 
 void TitanShiftApp::DrawSectionLabel(const wchar_t* text, float x, float y, float w) {
-    DrawLine(x, y + S(7.f), x + w, y + S(7.f), C::BORDER, 0.5f);
-    DrawText(text, R(x, y, w, S(14.f)), FONT_MONO_SM, C::TEXT_DIM,
+    DrawLineSeg(x, y + S(7.f), x + w, y + S(7.f), C::BORDER, 0.5f);
+    DrawTextEx(text, R(x, y, w, S(14.f)), FONT_MONO_SM, C::TEXT_DIM,
         DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_PARAGRAPH_ALIGNMENT_NEAR);
 }
 
-// ─────────────────────────────────────────────────────────────────
-// DrawButton
-// ─────────────────────────────────────────────────────────────────
 void TitanShiftApp::DrawButton(const Button& btn) {
     if (!m_rt) return;
+    if (btn.rect.right - btn.rect.left <= 0) return; // hidden
     D2D1_RECT_F r = btn.rect;
     float rad = S(3.f);
 
-    D2D1_COLOR_F fill, textCol, stroke;
-    stroke = {0,0,0,0};
+    D2D1_COLOR_F fill, textCol;
 
     if (!btn.enabled) {
-        fill    = C::BG2;
+        DrawRoundRect(r, rad, C::BG2, C::BORDER, 0.5f);
         textCol = C::TEXT_DIM;
-        D2D1_COLOR_F sc = C::BORDER;
-        DrawRoundRect(r, rad, fill, sc, 0.5f);
+    } else if (btn.id == BTN_RUN) {
+        bool del = (m_mode == OpMode::DEL);
+        fill    = del ? C::DANGER : C::ACCENT;
+        textCol = del ? D2D1_COLOR_F{1,1,1,1} : C::ACCENT_DK;
+        DrawRoundRect(r, rad, fill, {0,0,0,0}, 0.f);
     } else if (btn.active && !btn.danger) {
-        fill    = C::ACCENT;
+        DrawRoundRect(r, rad, C::ACCENT, {0,0,0,0}, 0.f);
         textCol = C::ACCENT_DK;
-        DrawRoundRect(r, rad, fill, {0,0,0,0}, 0.f);
     } else if (btn.active && btn.danger) {
-        fill    = C::DANGER;
-        textCol = {1,1,1,1};
-        DrawRoundRect(r, rad, fill, {0,0,0,0}, 0.f);
+        DrawRoundRect(r, rad, C::DANGER, {0,0,0,0}, 0.f);
+        textCol = D2D1_COLOR_F{1,1,1,1};
     } else if (btn.hovered && !btn.danger) {
-        fill    = C::BG3;
-        textCol = C::ACCENT;
         D2D1_COLOR_F sc = C::ACCENT; sc.a = 0.5f;
-        DrawRoundRect(r, rad, fill, sc, 0.5f);
+        DrawRoundRect(r, rad, C::BG3, sc, 0.5f);
+        textCol = C::ACCENT;
     } else if (btn.hovered && btn.danger) {
-        fill    = {0.2f, 0.04f, 0.05f, 1.f};
+        DrawRoundRect(r, rad, {0.2f, 0.04f, 0.05f, 1.f}, C::DANGER, 0.5f);
         textCol = C::DANGER;
-        DrawRoundRect(r, rad, fill, C::DANGER, 0.5f);
     } else {
-        fill    = C::BG2;
+        DrawRoundRect(r, rad, C::BG2, C::BORDER, 0.5f);
         textCol = C::TEXT_DIM;
-        DrawRoundRect(r, rad, fill, C::BORDER, 0.5f);
     }
 
-    // Special: RUN button fills full width
-    if (btn.id == BTN_RUN) {
-        if (btn.enabled) {
-            bool del = (m_mode == OpMode::DELETE);
-            fill    = del ? C::DANGER : C::ACCENT;
-            textCol = del ? D2D1_COLOR_F{1,1,1,1} : C::ACCENT_DK;
-            DrawRoundRect(r, rad, fill, {0,0,0,0}, 0.f);
-        }
-    }
-
-    DrawText(btn.label.c_str(), r, FONT_MONO_SM, textCol,
+    DrawTextEx(btn.label.c_str(), r, FONT_MONO_SM, textCol,
         DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
 }
 
 // ─────────────────────────────────────────────────────────────────
-// OnPaint — main render entry
+// OnPaint
 // ─────────────────────────────────────────────────────────────────
 void TitanShiftApp::OnPaint() {
     if (!m_rt) return;
@@ -517,19 +414,14 @@ void TitanShiftApp::OnPaint() {
     RECT rc; GetClientRect(m_hwnd, &rc);
     float W = (float)(rc.right - rc.left);
     float H = (float)(rc.bottom - rc.top);
-    m_size  = {W, H};
+    m_size = {W, H};
 
-    const float LP  = S(320.f);
-    const float TB  = S(32.f);
+    const float LP = S(320.f);
+    const float TB = S(36.f);
 
-    // Background
     m_rt->Clear(C::BG);
-
-    // Left panel background
     DrawRect(R(0, TB, LP, H - TB), C::BG1);
-
-    // Divider line
-    DrawLine(LP, TB, LP, H, C::BORDER, 1.f);
+    DrawLineSeg(LP, TB, LP, H, C::BORDER, 1.f);
 
     DrawTitleBar();
     DrawLeftPanel();
@@ -539,115 +431,94 @@ void TitanShiftApp::OnPaint() {
     if (hr == D2DERR_RECREATE_TARGET) RecreateTarget();
 }
 
-// ─────────────────────────────────────────────────────────────────
-// DrawTitleBar
-// ─────────────────────────────────────────────────────────────────
 void TitanShiftApp::DrawTitleBar() {
     float W = m_size.width;
-    float TB = S(32.f);
+    float TB = S(36.f);
 
     DrawRect(R(0, 0, W, TB), C::BG1);
-    DrawLine(0, TB, W, TB, C::BORDER, 0.5f);
+    DrawLineSeg(0, TB, W, TB, C::BORDER, 0.5f);
 
-    // Logo diamond
+    // Logo
     float lx = S(14.f), ly = TB/2.f;
-    D2D1_POINT_2F pts[4] = {{lx, ly-S(7.f)}, {lx+S(7.f), ly}, {lx, ly+S(7.f)}, {lx-S(7.f), ly}};
     SetBrushColor(C::ACCENT);
-    // Draw diamond as 4 lines
-    for (int i = 0; i < 4; i++) {
+    D2D1_POINT_2F pts[4] = {
+        {lx, ly-S(7.f)}, {lx+S(7.f), ly}, {lx, ly+S(7.f)}, {lx-S(7.f), ly}
+    };
+    for (int i = 0; i < 4; i++)
         m_rt->DrawLine(pts[i], pts[(i+1)%4], m_brush, S(1.2f));
-    }
 
-    // App name
-    DrawText(L"TITANSHIFT", R(S(28.f), 0, S(120.f), TB), FONT_MONO_MD, C::ACCENT,
+    DrawTextEx(L"TITANSHIFT", R(S(28.f), 0, S(120.f), TB), FONT_MONO_MD, C::ACCENT,
         DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
-    DrawText(L"v2.0", R(S(148.f), 0, S(40.f), TB), FONT_MONO_SM, C::TEXT_DIM,
+    DrawTextEx(L"v2.0", R(S(150.f), 0, S(40.f), TB), FONT_MONO_SM, C::TEXT_DIM,
         DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
 
-    // State indicator
     if (m_opState == OpState::RUNNING || m_opState == OpState::SCANNING) {
-        DrawText(L"● ACTIVE", R(S(200.f), 0, S(100.f), TB), FONT_MONO_SM, C::ACCENT,
+        DrawTextEx(L"● ACTIVE", R(S(200.f), 0, S(100.f), TB), FONT_MONO_SM, C::ACCENT,
+            DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+    } else if (m_opState == OpState::PAUSED) {
+        DrawTextEx(L"❚❚ PAUSED", R(S(200.f), 0, S(100.f), TB), FONT_MONO_SM, C::INFO,
             DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
     }
-
-    // Win controls
-    m_buttons[BTN_WIN_MIN].label   = L"─";
-    m_buttons[BTN_WIN_MAX].label   = L"□";
-    m_buttons[BTN_WIN_CLOSE].label = L"✕";
-    m_buttons[BTN_WIN_CLOSE].danger = true;
-    DrawButton(m_buttons[BTN_WIN_MIN]);
-    DrawButton(m_buttons[BTN_WIN_MAX]);
-    DrawButton(m_buttons[BTN_WIN_CLOSE]);
 }
 
-// ─────────────────────────────────────────────────────────────────
-// DrawLeftPanel
-// ─────────────────────────────────────────────────────────────────
 void TitanShiftApp::DrawLeftPanel() {
     const float LP  = S(320.f);
-    const float TB  = S(32.f);
+    const float TB  = S(36.f);
     const float PAD = S(12.f);
     const float BTH = S(26.f);
     float y = TB + PAD;
 
-    // ── Mode bar ──────────────────────────────────────────
     static const wchar_t* modeLabels[] = {L"COPY",L"MOVE",L"RENAME",L"DELETE",L"DEDUPE",L"SYNC"};
-    BtnID modes[] = {BTN_MODE_COPY,BTN_MODE_MOVE,BTN_MODE_RENAME,BTN_MODE_DELETE,BTN_MODE_DEDUPE,BTN_MODE_SYNC};
+    BtnID modes[] = {BTN_MODE_COPY,BTN_MODE_MOVE,BTN_MODE_RENAME,
+                     BTN_MODE_DELETE,BTN_MODE_DEDUPE,BTN_MODE_SYNC};
     for (int i = 0; i < 6; i++) {
         m_buttons[modes[i]].label  = modeLabels[i];
         m_buttons[modes[i]].active = ((int)m_mode == i);
         DrawButton(m_buttons[modes[i]]);
     }
-    y += BTH + S(10.f);
+    y += BTH + S(20.f);
 
-    // ── SOURCE ────────────────────────────────────────────
     DrawSectionLabel(L"SOURCE", PAD, y, LP - PAD*2);
     y += S(14.f);
-
-    // Drop zone
     float dzH = S(50.f);
     DrawRoundRect(R(PAD, y, LP - PAD*2, dzH), S(4.f), C::BG2, C::BORDER2, 0.5f);
-    DrawText(L"Drop files/folders here — or use buttons below",
+    DrawTextEx(L"Use buttons below to add files / folder",
         R(PAD, y, LP - PAD*2, dzH), FONT_MONO_SM, C::TEXT_DIM,
         DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
-    y += dzH + S(4.f);
+    y += dzH + S(8.f);
 
-    // Source file list
     float listH = S(90.f);
     DrawRoundRect(R(PAD, y, LP - PAD*2, listH), S(2.f), C::BG, C::BORDER, 0.5f);
     {
-        std::vector<FileEntry> srcs;
-        srcs = m_sources; // copy for render
         float iy = y + S(4.f);
         float lineH = S(16.f);
         int maxVisible = (int)(listH / lineH) - 1;
+        int total = (int)m_sources.size();
         int start = m_srcScrollOffset;
-        int end   = std::min((int)srcs.size(), start + maxVisible);
+        if (start > total - maxVisible) start = std::max(0, total - maxVisible);
+        int end   = std::min(total, start + maxVisible);
         for (int i = start; i < end; i++) {
+            const auto& s = m_sources[i];
             D2D1_COLOR_F bg = (i % 2 == 0) ? C::BG : C::BG1;
             DrawRect(R(PAD + S(1.f), iy, LP - PAD*2 - S(2.f), lineH), bg);
-            DrawText(srcs[i].name.c_str(),
-                R(PAD + S(6.f), iy, LP - PAD*2 - S(12.f), lineH),
+            DrawTextEx(s.name.c_str(),
+                R(PAD + S(6.f), iy, LP - PAD*2 - S(70.f), lineH),
                 FONT_MONO_SM, C::TEXT,
                 DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
-            // Size
-            wchar_t sz[32];
-            swprintf_s(sz, L"%s", FormatBytes(srcs[i].size).c_str());
-            DrawText(sz, R(PAD + S(6.f), iy, LP - PAD*2 - S(12.f), lineH),
+            std::wstring sz = s.isDir ? std::wstring(L"<DIR>") : FormatBytes(s.size);
+            DrawTextEx(sz.c_str(), R(PAD + S(6.f), iy, LP - PAD*2 - S(12.f), lineH),
                 FONT_MONO_SM, C::TEXT_DIM,
                 DWRITE_TEXT_ALIGNMENT_TRAILING, DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
             iy += lineH;
         }
-        if (srcs.empty()) {
-            DrawText(L"No files selected",
-                R(PAD, y, LP - PAD*2, listH),
-                FONT_MONO_SM, C::TEXT_DIM,
+        if (m_sources.empty()) {
+            DrawTextEx(L"No files selected",
+                R(PAD, y, LP - PAD*2, listH), FONT_MONO_SM, C::TEXT_DIM,
                 DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
         }
     }
-    y += listH + S(4.f);
+    y += listH + S(8.f);
 
-    // Source buttons
     m_buttons[BTN_ADD_FILES].label  = L"+ Files";
     m_buttons[BTN_ADD_FOLDER].label = L"+ Folder";
     m_buttons[BTN_CLEAR_SRC].label  = L"Clear";
@@ -655,176 +526,154 @@ void TitanShiftApp::DrawLeftPanel() {
     DrawButton(m_buttons[BTN_ADD_FILES]);
     DrawButton(m_buttons[BTN_ADD_FOLDER]);
     DrawButton(m_buttons[BTN_CLEAR_SRC]);
-    y += BTH + S(10.f);
+    y += BTH + S(20.f);
 
-    // ── DESTINATION ───────────────────────────────────────
-    bool showDest = (m_mode != OpMode::DELETE && m_mode != OpMode::DEDUPE);
+    bool showDest   = (m_mode != OpMode::DEL && m_mode != OpMode::DEDUPE);
     bool showRename = (m_mode == OpMode::RENAME);
 
     if (showDest && !showRename) {
         DrawSectionLabel(L"DESTINATION", PAD, y, LP - PAD*2);
         y += S(14.f);
         DrawRoundRect(R(PAD, y, LP - PAD*2 - S(68.f), BTH), S(2.f), C::BG2, C::BORDER, 0.5f);
-        const wchar_t* dtext = m_dest.empty() ? L"—" : m_dest.c_str();
+        const wchar_t* dtext = m_dest.empty() ? L"Click Browse to choose…" : m_dest.c_str();
         D2D1_COLOR_F dc = m_dest.empty() ? C::TEXT_DIM : C::ACCENT;
-        DrawText(dtext, R(PAD + S(6.f), y, LP - PAD*2 - S(74.f), BTH),
+        DrawTextEx(dtext, R(PAD + S(6.f), y, LP - PAD*2 - S(80.f), BTH),
             FONT_MONO_SM, dc, DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
         m_buttons[BTN_PICK_DEST].label = L"Browse";
         DrawButton(m_buttons[BTN_PICK_DEST]);
-        y += BTH + S(10.f);
-    }
-
-    if (showRename) {
+        y += BTH + S(20.f);
+    } else if (showRename) {
         DrawSectionLabel(L"RENAME PATTERN", PAD, y, LP - PAD*2);
         y += S(14.f);
-        DrawText(L"Tokens: {name} {ext} {n} {date}", R(PAD, y, LP-PAD*2, S(14.f)),
-            FONT_MONO_SM, C::TEXT_DIM);
+        DrawTextEx(L"Tokens: {name} {ext} {n} {date}",
+            R(PAD, y, LP-PAD*2, S(14.f)), FONT_MONO_SM, C::TEXT_DIM,
+            DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
         y += S(16.f);
-        // Input box
-        bool active = m_renameInputActive;
-        DrawRoundRect(R(PAD, y, LP - PAD*2, BTH), S(2.f),
-            C::BG2, active ? C::ACCENT : C::BORDER, active ? 1.f : 0.5f);
-        std::wstring disp = m_renameInput.empty() ? L"e.g. report_{n}{ext}" : m_renameInput;
+        D2D1_COLOR_F bc = m_renameInputActive ? C::ACCENT : C::BORDER;
+        DrawRoundRect(R(PAD, y, LP - PAD*2, BTH), S(2.f), C::BG2, bc, m_renameInputActive ? 1.f : 0.5f);
+        std::wstring disp = m_renameInput.empty() ? std::wstring(L"e.g. report_{n}{ext}") : m_renameInput;
         D2D1_COLOR_F ic = m_renameInput.empty() ? C::TEXT_DIM : C::TEXT;
-        DrawText(disp.c_str(), R(PAD + S(6.f), y, LP - PAD*2 - S(12.f), BTH),
+        DrawTextEx(disp.c_str(), R(PAD + S(6.f), y, LP - PAD*2 - S(12.f), BTH),
             FONT_MONO_MD, ic, DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
-        y += BTH + S(10.f);
+        y += BTH + S(20.f);
+    } else {
+        y += BTH + S(20.f); // keep layout aligned
     }
 
-    // ── OPTIONS ───────────────────────────────────────────
     DrawSectionLabel(L"OPTIONS", PAD, y, LP - PAD*2);
     y += S(14.f);
-    m_buttons[BTN_OPT_OVERWRITE].label = m_buttons[BTN_OPT_OVERWRITE].active ? L"✓ Overwrite" : L"  Overwrite";
-    m_buttons[BTN_OPT_VERIFY].label    = m_buttons[BTN_OPT_VERIFY].active    ? L"✓ Verify"    : L"  Verify";
-    m_buttons[BTN_OPT_PRESERVE].label  = m_buttons[BTN_OPT_PRESERVE].active  ? L"✓ Timestamps": L"  Timestamps";
+    m_buttons[BTN_OPT_OVERWRITE].label = m_buttons[BTN_OPT_OVERWRITE].active ? L"✓ Overwrite" : L"Overwrite";
+    m_buttons[BTN_OPT_VERIFY].label    = m_buttons[BTN_OPT_VERIFY].active    ? L"✓ Verify"    : L"Verify";
+    m_buttons[BTN_OPT_PRESERVE].label  = m_buttons[BTN_OPT_PRESERVE].active  ? L"✓ Times"     : L"Times";
     DrawButton(m_buttons[BTN_OPT_OVERWRITE]);
     DrawButton(m_buttons[BTN_OPT_VERIFY]);
     DrawButton(m_buttons[BTN_OPT_PRESERVE]);
-
-    // Thread count spinner
-    wchar_t thr[16]; swprintf_s(thr, L"×%d", m_threadCount);
+    wchar_t thr[16]; swprintf(thr, 16, L"x%d", m_threadCount);
     m_buttons[BTN_OPT_THREADS].label = thr;
     DrawButton(m_buttons[BTN_OPT_THREADS]);
-    DrawText(L"threads", R(m_buttons[BTN_OPT_THREADS].rect.right + S(4.f), y, S(50.f), BTH),
-        FONT_MONO_SM, C::TEXT_DIM, DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
-    y += BTH + S(10.f);
+    y += BTH + S(8.f);
 
-    // ── RUN BUTTON ────────────────────────────────────────
     static const wchar_t* runLabels[] = {
-        L"▶  RUN COPY", L"▶  RUN MOVE", L"▶  RUN RENAME",
-        L"▶  DELETE FILES", L"▶  RUN DEDUPE", L"▶  RUN SYNC"
+        L"▶ RUN COPY", L"▶ RUN MOVE", L"▶ RUN RENAME",
+        L"▶ DELETE FILES", L"▶ RUN DEDUPE", L"▶ RUN SYNC"
     };
     m_buttons[BTN_RUN].label = runLabels[(int)m_mode];
-    m_buttons[BTN_RUN].rect  = R(PAD, y, LP - PAD*2, S(36.f));
     DrawButton(m_buttons[BTN_RUN]);
-    y += S(36.f) + S(10.f);
+    y += S(36.f) + S(14.f);
 
-    // ── LOG PANEL ─────────────────────────────────────────
-    DrawSectionLabel(L"LOG", PAD, y, LP - PAD*2);
+    DrawSectionLabel(L"LOG", PAD, y, LP - PAD*2 - S(54.f));
     m_buttons[BTN_CLEAR_LOG].label = L"Clear";
-    m_buttons[BTN_CLEAR_LOG].rect  = R(LP - PAD - S(44.f), y, S(44.f), S(12.f));
     DrawButton(m_buttons[BTN_CLEAR_LOG]);
     y += S(14.f);
 
     float logH = m_size.height - y - PAD;
+    if (logH < S(60.f)) logH = S(60.f);
     DrawRoundRect(R(PAD, y, LP - PAD*2, logH), S(2.f), C::BG, C::BORDER, 0.5f);
     {
         std::lock_guard<std::mutex> lk(m_logMutex);
-        float ly2  = y + S(4.f);
         float lineH = S(14.f);
-        int maxVis = (int)(logH / lineH) - 1;
-        int total  = (int)m_logs.size();
-        int start  = std::max(0, total - maxVis - m_logScrollOffset);
-        int end    = std::min(total, start + maxVis);
+        int maxVis  = (int)(logH / lineH) - 1;
+        int total   = (int)m_logs.size();
+        int start   = std::max(0, total - maxVis);
+        int end     = total;
 
-        static const D2D1_COLOR_F logColors[] = {
-            C::TEXT_DIM,  // INFO
-            C::SUCCESS,   // SUCCESS
-            C::WARN,      // WARN
-            C::DANGER,    // ERR
-        };
+        static const D2D1_COLOR_F logColors[] = { C::TEXT_DIM, C::SUCCESS, C::WARN, C::DANGER };
 
+        float ly2 = y + S(4.f);
         for (int i = start; i < end; i++) {
             const auto& e = m_logs[i];
             std::wstring line = L"[" + e.timestamp + L"] " + e.msg;
-            D2D1_COLOR_F col = logColors[(int)e.level];
-            DrawText(line.c_str(), R(PAD + S(4.f), ly2, LP - PAD*2 - S(8.f), lineH),
-                FONT_MONO_SM, col, DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_PARAGRAPH_ALIGNMENT_NEAR);
+            int idx = (int)e.level;
+            if (idx < 0 || idx > 3) idx = 0;
+            DrawTextEx(line.c_str(),
+                R(PAD + S(4.f), ly2, LP - PAD*2 - S(8.f), lineH),
+                FONT_MONO_SM, logColors[idx],
+                DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_PARAGRAPH_ALIGNMENT_NEAR);
             ly2 += lineH;
         }
     }
 }
 
-// ─────────────────────────────────────────────────────────────────
-// DrawRightPanel
-// ─────────────────────────────────────────────────────────────────
 void TitanShiftApp::DrawRightPanel() {
     const float LP  = S(320.f);
-    const float TB  = S(32.f);
+    const float TB  = S(36.f);
     const float PAD = S(12.f);
     float x = LP + PAD;
     float y = TB + PAD;
     float pw = m_size.width - LP - PAD*2;
 
-    // ── PROGRESS ─────────────────────────────────────────
     DrawSectionLabel(L"PROGRESS", x, y, pw);
     y += S(14.f);
     DrawProgressCard(x, y, pw);
-    y += S(100.f) + S(10.f);
+    y += S(108.f) + S(12.f);
 
-    // ── THROUGHPUT GRAPH ─────────────────────────────────
     DrawSectionLabel(L"THROUGHPUT (MB/s)", x, y, pw);
     y += S(14.f);
-    float graphH = S(120.f);
+    float graphH = S(130.f);
     DrawThroughputGraph(x, y, pw, graphH);
-    y += graphH + S(10.f);
+    y += graphH + S(12.f);
 
-    // ── HARDWARE METRICS ─────────────────────────────────
     DrawSectionLabel(L"HARDWARE", x, y, pw);
     y += S(14.f);
 
-    float metW = (pw - S(8.f)*2) / 3.f;
-    float metH = S(110.f);
+    float metW = (pw - S(10.f)*2) / 3.f;
+    float metH = S(115.f);
 
-    // CPU ring
-    float cx1 = x + metW/2.f;
     SystemMetrics m;
     { std::lock_guard<std::mutex> lk(m_metricsMutex); m = m_metrics; }
 
+    // CPU
     DrawRoundRect(R(x, y, metW, metH), S(4.f), C::BG1, C::BORDER, 0.5f);
-    DrawText(L"CPU", R(x, y + S(6.f), metW, S(14.f)), FONT_MONO_SM, C::TEXT_DIM,
+    DrawTextEx(L"CPU", R(x, y + S(8.f), metW, S(14.f)), FONT_MONO_SM, C::TEXT_DIM,
         DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
-    DrawMetricRing(cx1, y + S(20.f) + S(24.f), S(24.f), m.cpuLoad / 100.f, C::ACCENT,
-        nullptr, nullptr);
-    wchar_t cv[16]; swprintf_s(cv, L"%.0f%%", m.cpuLoad);
-    DrawText(cv, R(x, y + S(20.f) + S(8.f), metW, S(32.f)), FONT_MONO_MD, C::TEXT,
+    float cx1 = x + metW/2.f;
+    float cy1 = y + S(28.f) + S(26.f);
+    DrawMetricRing(cx1, cy1, S(26.f), m.cpuLoad / 100.f, C::ACCENT);
+    wchar_t cv[16]; swprintf(cv, 16, L"%.0f%%", m.cpuLoad);
+    DrawTextEx(cv, R(x, cy1 - S(8.f), metW, S(18.f)), FONT_MONO_MD, C::TEXT,
         DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
-    DrawText(L"CPU LOAD", R(x, y + metH - S(20.f), metW, S(14.f)), FONT_MONO_SM, C::TEXT_DIM,
+    DrawTextEx(L"LOAD", R(x, y + metH - S(18.f), metW, S(14.f)), FONT_MONO_SM, C::TEXT_DIM,
         DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
 
-    // MEM ring
-    float cx2 = x + metW + S(8.f) + metW/2.f;
-    DrawRoundRect(R(x + metW + S(8.f), y, metW, metH), S(4.f), C::BG1, C::BORDER, 0.5f);
-    DrawText(L"MEMORY", R(x + metW + S(8.f), y + S(6.f), metW, S(14.f)), FONT_MONO_SM, C::TEXT_DIM,
+    // Memory
+    float mx2 = x + metW + S(10.f);
+    DrawRoundRect(R(mx2, y, metW, metH), S(4.f), C::BG1, C::BORDER, 0.5f);
+    DrawTextEx(L"MEMORY", R(mx2, y + S(8.f), metW, S(14.f)), FONT_MONO_SM, C::TEXT_DIM,
         DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
-    DrawMetricRing(cx2, y + S(20.f) + S(24.f), S(24.f), m.memUsedPct / 100.f, C::INFO,
-        nullptr, nullptr);
-    wchar_t mv[16]; swprintf_s(mv, L"%.0f%%", m.memUsedPct);
-    DrawText(mv, R(x + metW + S(8.f), y + S(20.f) + S(8.f), metW, S(32.f)), FONT_MONO_MD, C::TEXT,
+    float cx2 = mx2 + metW/2.f;
+    DrawMetricRing(cx2, cy1, S(26.f), m.memUsedPct / 100.f, C::INFO);
+    wchar_t mv[16]; swprintf(mv, 16, L"%.0f%%", m.memUsedPct);
+    DrawTextEx(mv, R(mx2, cy1 - S(8.f), metW, S(18.f)), FONT_MONO_MD, C::TEXT,
         DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
     std::wstring memSub = FormatBytes(m.memUsed) + L" / " + FormatBytes(m.memTotal);
-    DrawText(memSub.c_str(), R(x + metW + S(8.f), y + metH - S(20.f), metW, S(14.f)),
-        FONT_MONO_SM, C::TEXT_DIM, DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+    DrawTextEx(memSub.c_str(), R(mx2, y + metH - S(18.f), metW, S(14.f)), FONT_MONO_SM, C::TEXT_DIM,
+        DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
 
-    // DISK bars
-    DrawDiskMetric(x + (metW + S(8.f))*2, y, metW, metH);
+    DrawDiskMetric(x + (metW + S(10.f))*2, y, metW, metH);
 }
 
-// ─────────────────────────────────────────────────────────────────
-// DrawProgressCard
-// ─────────────────────────────────────────────────────────────────
 void TitanShiftApp::DrawProgressCard(float x, float y, float w) {
-    float h   = S(100.f);
+    float h   = S(108.f);
     float PAD = S(10.f);
 
     DrawRoundRect(R(x, y, w, h), S(4.f), C::BG1, C::BORDER, 0.5f);
@@ -832,9 +681,8 @@ void TitanShiftApp::DrawProgressCard(float x, float y, float w) {
     ProgressPayload p;
     { std::lock_guard<std::mutex> lk(m_progressMutex); p = m_lastProgress; }
 
-    // Status badge
     static const wchar_t* stateLabels[] = {
-        L"IDLE", L"SCANNING…", L"IN PROGRESS", L"PAUSED", L"COMPLETE", L"CANCELLED", L"ERROR"
+        L"IDLE", L"SCANNING", L"IN PROGRESS", L"PAUSED", L"COMPLETE", L"CANCELLED", L"ERROR"
     };
     static const D2D1_COLOR_F stateColors[] = {
         C::TEXT_DIM, C::WARN, C::ACCENT, C::INFO, C::SUCCESS, C::DANGER, C::DANGER
@@ -842,185 +690,147 @@ void TitanShiftApp::DrawProgressCard(float x, float y, float w) {
     int si = (int)m_opState;
     if (si < 0 || si > 6) si = 0;
 
-    DrawRoundRect(R(x + PAD, y + PAD, S(90.f), S(18.f)), S(2.f),
-        {stateColors[si].r*0.1f, stateColors[si].g*0.1f, stateColors[si].b*0.1f, 1.f},
-        stateColors[si], 0.5f);
-    DrawText(stateLabels[si], R(x + PAD, y + PAD, S(90.f), S(18.f)),
+    D2D1_COLOR_F badgeBg = {stateColors[si].r * 0.15f, stateColors[si].g * 0.15f, stateColors[si].b * 0.15f, 1.f};
+    DrawRoundRect(R(x + PAD, y + PAD, S(100.f), S(20.f)), S(2.f),
+        badgeBg, stateColors[si], 0.5f);
+    DrawTextEx(stateLabels[si], R(x + PAD, y + PAD, S(100.f), S(20.f)),
         FONT_MONO_SM, stateColors[si],
         DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
 
-    // Files / bytes meta
     if (p.totalFiles > 0) {
-        wchar_t meta[128];
-        swprintf_s(meta, L"%llu/%llu files  ·  %s / %s",
-            p.doneFiles, p.totalFiles,
+        wchar_t meta[256];
+        swprintf(meta, 256, L"%llu/%llu files  %s / %s",
+            (unsigned long long)p.doneFiles, (unsigned long long)p.totalFiles,
             FormatBytes(p.doneBytes).c_str(), FormatBytes(p.totalBytes).c_str());
-        DrawText(meta, R(x + PAD + S(96.f), y + PAD, w - PAD*2 - S(96.f), S(18.f)),
+        DrawTextEx(meta, R(x + PAD + S(110.f), y + PAD, w - PAD*2 - S(110.f), S(20.f)),
             FONT_MONO_SM, C::TEXT_DIM, DWRITE_TEXT_ALIGNMENT_TRAILING, DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
     }
 
-    // Current file
-    float fy = y + PAD + S(22.f);
+    float fy = y + PAD + S(24.f);
     if (!p.currentFile.empty()) {
-        DrawText(p.currentFile.c_str(), R(x + PAD, fy, w - PAD*2, S(16.f)),
+        DrawTextEx(p.currentFile.c_str(), R(x + PAD, fy, w - PAD*2, S(16.f)),
             FONT_MONO_SM, C::TEXT, DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
     }
     fy += S(18.f);
 
-    // Progress bar
-    float barW = w - PAD*2 - S(44.f);
+    float barW = w - PAD*2 - S(50.f);
     float barH = S(6.f);
     DrawRoundRect(R(x + PAD, fy + S(4.f), barW, barH), S(3.f), C::BG3, {0,0,0,0}, 0.f);
     if (p.pct > 0) {
         float fill = barW * (p.pct / 100.f);
         DrawRoundRect(R(x + PAD, fy + S(4.f), fill, barH), S(3.f), C::ACCENT, {0,0,0,0}, 0.f);
     }
-    wchar_t pct[8]; swprintf_s(pct, L"%d%%", p.pct);
-    DrawText(pct, R(x + PAD + barW + S(4.f), fy, S(36.f), S(14.f)),
+    wchar_t pct[16]; swprintf(pct, 16, L"%d%%", p.pct);
+    DrawTextEx(pct, R(x + PAD + barW + S(4.f), fy, S(42.f), S(14.f)),
         FONT_MONO_SM, C::ACCENT, DWRITE_TEXT_ALIGNMENT_TRAILING, DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
-    fy += S(16.f);
+    fy += S(14.f);
 
-    // Speed + ETA
     if (p.bytesPerSec > 0) {
         wchar_t spd[64];
-        swprintf_s(spd, L"%s/s  ·  ETA %s",
+        swprintf(spd, 64, L"%s/s   ETA %s",
             FormatBytes(p.bytesPerSec).c_str(), FormatETA(p.etaSecs).c_str());
-        DrawText(spd, R(x + PAD, fy, w - PAD*2, S(14.f)),
+        DrawTextEx(spd, R(x + PAD, fy, w - PAD*2 - S(220.f), S(14.f)),
             FONT_MONO_SM, C::TEXT_DIM, DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
     }
 
-    // Cancel / Pause buttons
     m_buttons[BTN_CANCEL].label = L"CANCEL";
     m_buttons[BTN_PAUSE].label  = (m_opState == OpState::PAUSED) ? L"RESUME" : L"PAUSE";
     DrawButton(m_buttons[BTN_CANCEL]);
     DrawButton(m_buttons[BTN_PAUSE]);
 }
 
-// ─────────────────────────────────────────────────────────────────
-// DrawThroughputGraph
-// ─────────────────────────────────────────────────────────────────
 void TitanShiftApp::DrawThroughputGraph(float x, float y, float w, float h) {
-    const float PAD = S(4.f);
+    const float PAD = S(6.f);
     DrawRoundRect(R(x, y, w, h), S(4.f), C::BG1, C::BORDER, 0.5f);
 
     SystemMetrics m;
     { std::lock_guard<std::mutex> lk(m_metricsMutex); m = m_metrics; }
 
-    auto drawSeries = [&](const std::deque<float>& hist, D2D1_COLOR_F lineCol, D2D1_COLOR_F fillCol) {
-        if (hist.empty()) return;
-        float maxVal = 1.f;
-        for (float v : hist) maxVal = std::max(maxVal, v);
+    float gX = x + PAD, gW = w - PAD*2;
+    float gY = y + PAD, gH = h - PAD*2 - S(14.f);
 
-        int   n   = (int)hist.size();
-        float gW  = w - PAD*2;
-        float gH  = h - PAD*2 - S(12.f);
-        float gX  = x + PAD;
-        float gY  = y + PAD;
-
-        // Build path as array of points
-        std::vector<D2D1_POINT_2F> pts;
-        pts.reserve(n + 2);
-        for (int i = 0; i < n; i++) {
-            float px = gX + (gW * i / std::max(1, n - 1));
-            float py = gY + gH - (hist[i] / maxVal) * gH;
-            pts.push_back({px, py});
-        }
-
-        if (pts.size() < 2) return;
-
-        // Draw line using DrawLine (Direct2D has no polyline directly)
-        SetBrushColor(lineCol);
-        for (int i = 0; i + 1 < (int)pts.size(); i++) {
-            m_rt->DrawLine(pts[i], pts[i+1], m_brush, S(1.5f));
-        }
-
-        // Scale label
-        wchar_t lbl[32]; swprintf_s(lbl, L"%.1f", maxVal);
-    };
-
-    // Grid lines
     int cols = 12, rows = 4;
-    float gX2 = x + PAD, gW2 = w - PAD*2;
-    float gY2 = y + PAD, gH2 = h - PAD*2 - S(12.f);
     for (int i = 0; i <= cols; i++) {
-        float lx = gX2 + gW2 * i / cols;
-        DrawLine(lx, gY2, lx, gY2 + gH2, C::BORDER, 0.5f);
+        float lx = gX + gW * i / cols;
+        DrawLineSeg(lx, gY, lx, gY + gH, C::BORDER, 0.5f);
     }
     for (int i = 0; i <= rows; i++) {
-        float ly = gY2 + gH2 * i / rows;
-        DrawLine(gX2, ly, gX2 + gW2, ly, C::BORDER, 0.5f);
+        float ly = gY + gH * i / rows;
+        DrawLineSeg(gX, ly, gX + gW, ly, C::BORDER, 0.5f);
     }
 
-    drawSeries(m.diskReadHistory,  C::INFO,   C::INFO);
-    drawSeries(m.diskWriteHistory, C::ACCENT, C::ACCENT);
+    float maxVal = 1.f;
+    for (float v : m.diskReadHistory)  if (v > maxVal) maxVal = v;
+    for (float v : m.diskWriteHistory) if (v > maxVal) maxVal = v;
 
-    // Legend
-    float lx = x + PAD;
-    float legY = y + h - S(12.f);
-    DrawText(L"▸ READ", R(lx, legY, S(60.f), S(12.f)), FONT_MONO_SM, C::INFO,
-        DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
-    DrawText(L"▸ WRITE", R(lx + S(65.f), legY, S(65.f), S(12.f)), FONT_MONO_SM, C::ACCENT,
-        DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+    auto plot = [&](const std::deque<float>& hist, D2D1_COLOR_F col) {
+        if (hist.size() < 2) return;
+        int n = (int)hist.size();
+        SetBrushColor(col);
+        for (int i = 0; i + 1 < n; i++) {
+            float x1 = gX + (gW * i)     / (float)(n-1);
+            float x2 = gX + (gW * (i+1)) / (float)(n-1);
+            float y1 = gY + gH - (hist[i]   / maxVal) * gH;
+            float y2 = gY + gH - (hist[i+1] / maxVal) * gH;
+            m_rt->DrawLine({x1,y1}, {x2,y2}, m_brush, S(1.5f));
+        }
+    };
 
-    // Scale
-    SystemMetrics m2; { std::lock_guard<std::mutex> lk(m_metricsMutex); m2 = m_metrics; }
-    float maxR = 0.1f, maxW2 = 0.1f;
-    for (float v : m2.diskReadHistory) maxR = std::max(maxR, v);
-    for (float v : m2.diskWriteHistory) maxW2 = std::max(maxW2, v);
-    wchar_t sc[32]; swprintf_s(sc, L"%.1f MB/s", std::max(maxR, maxW2));
-    DrawText(sc, R(x + PAD, y + PAD, w - PAD*2, S(12.f)),
-        FONT_MONO_SM, C::TEXT_DIM, DWRITE_TEXT_ALIGNMENT_TRAILING, DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+    plot(m.diskReadHistory,  C::INFO);
+    plot(m.diskWriteHistory, C::ACCENT);
+
+    DrawTextEx(L"▸ READ", R(gX, y + h - S(14.f), S(60.f), S(12.f)),
+        FONT_MONO_SM, C::INFO, DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+    DrawTextEx(L"▸ WRITE", R(gX + S(65.f), y + h - S(14.f), S(65.f), S(12.f)),
+        FONT_MONO_SM, C::ACCENT, DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+
+    wchar_t sc[32]; swprintf(sc, 32, L"%.1f MB/s", maxVal);
+    DrawTextEx(sc, R(gX, gY, gW, S(14.f)), FONT_MONO_SM, C::TEXT_DIM,
+        DWRITE_TEXT_ALIGNMENT_TRAILING, DWRITE_PARAGRAPH_ALIGNMENT_NEAR);
 }
 
-// ─────────────────────────────────────────────────────────────────
-// DrawMetricRing (Direct2D arc geometry)
-// ─────────────────────────────────────────────────────────────────
-void TitanShiftApp::DrawMetricRing(float cx, float cy, float r, float pct,
-                                    D2D1_COLOR_F color, const wchar_t*, const wchar_t*) {
+void TitanShiftApp::DrawMetricRing(float cx, float cy, float r, float pct, D2D1_COLOR_F color) {
     if (!m_rt || !m_d2dFactory) return;
+    if (pct < 0) pct = 0;
+    if (pct > 1) pct = 1;
 
     // Background ring
-    ID2D1PathGeometry* bgGeo = nullptr;
-    m_d2dFactory->CreatePathGeometry(&bgGeo);
-    if (!bgGeo) return;
-
-    // Draw background circle
     SetBrushColor(C::BG3);
     D2D1_ELLIPSE ell = { {cx, cy}, r, r };
     m_rt->DrawEllipse(ell, m_brush, S(5.f));
 
-    // Draw filled arc
-    float angle = pct * 360.f;
-    float startA = -90.f * (3.14159f / 180.f);
-    float sweepA =  angle * (3.14159f / 180.f);
+    if (pct <= 0.001f) return;
 
-    // Use DrawEllipse with different stroke-dasharray isn't possible in D2D directly.
-    // Use path geometry for arc fill.
-    float endA = startA + sweepA;
-    float rOut = r + S(2.5f), rIn = r - S(2.5f);
+    ID2D1PathGeometry* geo = nullptr;
+    if (FAILED(m_d2dFactory->CreatePathGeometry(&geo)) || !geo) return;
+
+    float startA = -90.f * (3.14159265f / 180.f);
+    float sweepA =  pct * 360.f * (3.14159265f / 180.f);
+    float endA   = startA + sweepA;
+    float rOut   = r + S(2.5f);
+    float rIn    = r - S(2.5f);
 
     ID2D1GeometrySink* sink = nullptr;
-    bgGeo->Open(&sink);
-    if (sink) {
+    if (SUCCEEDED(geo->Open(&sink)) && sink) {
         D2D1_POINT_2F startOuter = { cx + rOut * cosf(startA), cy + rOut * sinf(startA) };
         sink->BeginFigure(startOuter, D2D1_FIGURE_BEGIN_FILLED);
 
         D2D1_ARC_SEGMENT arcO{};
-        arcO.point       = { cx + rOut * cosf(endA), cy + rOut * sinf(endA) };
-        arcO.size        = { rOut, rOut };
-        arcO.rotationAngle = 0;
+        arcO.point          = { cx + rOut * cosf(endA), cy + rOut * sinf(endA) };
+        arcO.size           = { rOut, rOut };
+        arcO.rotationAngle  = 0;
         arcO.sweepDirection = D2D1_SWEEP_DIRECTION_CLOCKWISE;
-        arcO.arcSize     = (pct > 0.5f) ? D2D1_ARC_SIZE_LARGE : D2D1_ARC_SIZE_SMALL;
+        arcO.arcSize        = (pct > 0.5f) ? D2D1_ARC_SIZE_LARGE : D2D1_ARC_SIZE_SMALL;
         sink->AddArc(arcO);
 
         sink->AddLine({cx + rIn * cosf(endA), cy + rIn * sinf(endA)});
 
         D2D1_ARC_SEGMENT arcI{};
-        arcI.point       = startOuter;
-        arcI.size        = { rIn, rIn };
-        arcI.rotationAngle = 0;
+        arcI.point          = startOuter;
+        arcI.size           = { rIn, rIn };
+        arcI.rotationAngle  = 0;
         arcI.sweepDirection = D2D1_SWEEP_DIRECTION_COUNTER_CLOCKWISE;
-        arcI.arcSize     = (pct > 0.5f) ? D2D1_ARC_SIZE_LARGE : D2D1_ARC_SIZE_SMALL;
+        arcI.arcSize        = (pct > 0.5f) ? D2D1_ARC_SIZE_LARGE : D2D1_ARC_SIZE_SMALL;
         sink->AddArc(arcI);
 
         sink->EndFigure(D2D1_FIGURE_END_CLOSED);
@@ -1028,64 +838,65 @@ void TitanShiftApp::DrawMetricRing(float cx, float cy, float r, float pct,
         sink->Release();
 
         SetBrushColor(color);
-        m_rt->FillGeometry(bgGeo, m_brush);
+        m_rt->FillGeometry(geo, m_brush);
     }
-    bgGeo->Release();
+    geo->Release();
 }
 
-// ─────────────────────────────────────────────────────────────────
-// DrawDiskMetric
-// ─────────────────────────────────────────────────────────────────
 void TitanShiftApp::DrawDiskMetric(float x, float y, float w, float h) {
     DrawRoundRect(R(x, y, w, h), S(4.f), C::BG1, C::BORDER, 0.5f);
-    DrawText(L"DISK", R(x, y + S(6.f), w, S(14.f)), FONT_MONO_SM, C::TEXT_DIM,
+    DrawTextEx(L"DISK", R(x, y + S(8.f), w, S(14.f)), FONT_MONO_SM, C::TEXT_DIM,
         DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
 
     SystemMetrics m;
     { std::lock_guard<std::mutex> lk(m_metricsMutex); m = m_metrics; }
 
-    float maxVal = std::max(1.f, std::max(m.diskReadMBs, m.diskWriteMBs));
-    float pad = S(10.f);
-    float barW = w - pad*2 - S(30.f) - S(36.f);
+    float maxVal = 1.f;
+    if (m.diskReadMBs  > maxVal) maxVal = m.diskReadMBs;
+    if (m.diskWriteMBs > maxVal) maxVal = m.diskWriteMBs;
+
+    float pad  = S(10.f);
+    float lblW = S(14.f);
+    float numW = S(40.f);
+    float barW = w - pad*2 - lblW - numW - S(8.f);
     float barH = S(6.f);
 
-    // READ bar
-    float ry2 = y + S(28.f);
-    DrawText(L"R", R(x + pad, ry2, S(14.f), barH + S(4.f)), FONT_MONO_SM, C::TEXT_DIM,
+    float ry = y + S(34.f);
+    DrawTextEx(L"R", R(x + pad, ry - S(2.f), lblW, barH + S(8.f)), FONT_MONO_SM, C::TEXT_DIM,
         DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
-    DrawRoundRect(R(x + pad + S(18.f), ry2, barW, barH), S(3.f), C::BG3, {0,0,0,0}, 0.f);
+    DrawRoundRect(R(x + pad + lblW, ry, barW, barH), S(3.f), C::BG3, {0,0,0,0}, 0.f);
     float rFill = barW * (m.diskReadMBs / maxVal);
-    if (rFill > 0) DrawRoundRect(R(x + pad + S(18.f), ry2, rFill, barH), S(3.f), C::INFO, {0,0,0,0}, 0.f);
-    wchar_t rv[16]; swprintf_s(rv, L"%.1f", m.diskReadMBs);
-    DrawText(rv, R(x + pad + S(18.f) + barW + S(4.f), ry2, S(36.f), barH + S(4.f)),
+    if (rFill > 0)
+        DrawRoundRect(R(x + pad + lblW, ry, rFill, barH), S(3.f), C::INFO, {0,0,0,0}, 0.f);
+    wchar_t rv[16]; swprintf(rv, 16, L"%.1f", m.diskReadMBs);
+    DrawTextEx(rv, R(x + pad + lblW + barW + S(4.f), ry - S(2.f), numW, barH + S(8.f)),
         FONT_MONO_SM, C::TEXT, DWRITE_TEXT_ALIGNMENT_TRAILING, DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
 
-    // WRITE bar
-    float wy2 = ry2 + S(18.f);
-    DrawText(L"W", R(x + pad, wy2, S(14.f), barH + S(4.f)), FONT_MONO_SM, C::TEXT_DIM,
+    float wy = ry + S(20.f);
+    DrawTextEx(L"W", R(x + pad, wy - S(2.f), lblW, barH + S(8.f)), FONT_MONO_SM, C::TEXT_DIM,
         DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
-    DrawRoundRect(R(x + pad + S(18.f), wy2, barW, barH), S(3.f), C::BG3, {0,0,0,0}, 0.f);
+    DrawRoundRect(R(x + pad + lblW, wy, barW, barH), S(3.f), C::BG3, {0,0,0,0}, 0.f);
     float wFill = barW * (m.diskWriteMBs / maxVal);
-    if (wFill > 0) DrawRoundRect(R(x + pad + S(18.f), wy2, wFill, barH), S(3.f), C::ACCENT, {0,0,0,0}, 0.f);
-    wchar_t wv[16]; swprintf_s(wv, L"%.1f", m.diskWriteMBs);
-    DrawText(wv, R(x + pad + S(18.f) + barW + S(4.f), wy2, S(36.f), barH + S(4.f)),
+    if (wFill > 0)
+        DrawRoundRect(R(x + pad + lblW, wy, wFill, barH), S(3.f), C::ACCENT, {0,0,0,0}, 0.f);
+    wchar_t wv[16]; swprintf(wv, 16, L"%.1f", m.diskWriteMBs);
+    DrawTextEx(wv, R(x + pad + lblW + barW + S(4.f), wy - S(2.f), numW, barH + S(8.f)),
         FONT_MONO_SM, C::TEXT, DWRITE_TEXT_ALIGNMENT_TRAILING, DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
 
-    DrawText(L"MB/s", R(x, wy2 + S(14.f), w, S(12.f)), FONT_MONO_SM, C::TEXT_DIM,
+    DrawTextEx(L"MB/s", R(x, y + h - S(18.f), w, S(14.f)), FONT_MONO_SM, C::TEXT_DIM,
         DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
 }
 
 // ─────────────────────────────────────────────────────────────────
-// Input handling
+// Input
 // ─────────────────────────────────────────────────────────────────
 Button* TitanShiftApp::HitTestButtons(int x, int y) {
     float fx = (float)x, fy = (float)y;
     for (int i = 0; i < BTN_COUNT; i++) {
         auto& b = m_buttons[i];
+        if (b.rect.right - b.rect.left <= 0) continue;
         if (fx >= b.rect.left && fx <= b.rect.right &&
-            fy >= b.rect.top  && fy <= b.rect.bottom) {
-            return &b;
-        }
+            fy >= b.rect.top  && fy <= b.rect.bottom) return &b;
     }
     return nullptr;
 }
@@ -1096,18 +907,12 @@ void TitanShiftApp::OnLButtonDown(int x, int y) {
     if (btn && btn->enabled) {
         btn->pressed = true;
         OnButtonClick(btn->id);
-        InvalidateRect(m_hwnd, nullptr, FALSE);
     }
-
-    // Rename input click
-    auto& rn = m_buttons[BTN_MODE_RENAME];
-    bool inRenameBox = false;
-    // Check if rename input box was clicked (simple rect test)
-    m_renameInputActive = false;
+    m_renameInputActive = (m_mode == OpMode::RENAME);
     InvalidateRect(m_hwnd, nullptr, FALSE);
 }
 
-void TitanShiftApp::OnLButtonUp(int x, int y) {
+void TitanShiftApp::OnLButtonUp(int, int) {
     ReleaseCapture();
     for (auto& b : m_buttons) b.pressed = false;
 }
@@ -1118,20 +923,17 @@ void TitanShiftApp::OnMouseMove(int x, int y) {
         TrackMouseEvent(&tme);
         m_trackingMouse = true;
     }
-
     float fx = (float)x, fy = (float)y;
     bool changed = false;
     for (int i = 0; i < BTN_COUNT; i++) {
         auto& b = m_buttons[i];
         bool was = b.hovered;
-        b.hovered = (fx >= b.rect.left && fx <= b.rect.right &&
-                     fy >= b.rect.top  && fy <= b.rect.bottom);
+        b.hovered = (b.rect.right - b.rect.left > 0)
+                  && (fx >= b.rect.left && fx <= b.rect.right
+                  &&  fy >= b.rect.top  && fy <= b.rect.bottom);
         if (b.hovered != was) changed = true;
     }
-    if (changed) {
-        SetCursor(LoadCursorW(nullptr, IDC_ARROW));
-        InvalidateRect(m_hwnd, nullptr, FALSE);
-    }
+    if (changed) InvalidateRect(m_hwnd, nullptr, FALSE);
 }
 
 void TitanShiftApp::OnMouseLeave() {
@@ -1141,7 +943,7 @@ void TitanShiftApp::OnMouseLeave() {
 }
 
 void TitanShiftApp::OnMouseWheel(int delta, int, int) {
-    m_logScrollOffset = std::max(0, m_logScrollOffset + (delta > 0 ? 1 : -1));
+    m_logScrollOffset = std::max(0, m_logScrollOffset + (delta > 0 ? -1 : 1));
     InvalidateRect(m_hwnd, nullptr, FALSE);
 }
 
@@ -1156,7 +958,7 @@ void TitanShiftApp::OnChar(wchar_t c) {
 }
 
 void TitanShiftApp::OnKeyDown(WPARAM vk) {
-    if (vk == VK_ESCAPE && m_renameInputActive) {
+    if (vk == VK_ESCAPE) {
         m_renameInputActive = false;
         InvalidateRect(m_hwnd, nullptr, FALSE);
     }
@@ -1167,25 +969,30 @@ void TitanShiftApp::OnKeyDown(WPARAM vk) {
 // ─────────────────────────────────────────────────────────────────
 void TitanShiftApp::OnButtonClick(BtnID id) {
     switch (id) {
-    case BTN_WIN_MIN:   ShowWindow(m_hwnd, SW_MINIMIZE); break;
-    case BTN_WIN_MAX:   ShowWindow(m_hwnd, IsZoomed(m_hwnd) ? SW_RESTORE : SW_MAXIMIZE); break;
-    case BTN_WIN_CLOSE: DestroyWindow(m_hwnd); break;
-
-    case BTN_MODE_COPY:   m_mode = OpMode::COPY;   break;
-    case BTN_MODE_MOVE:   m_mode = OpMode::MOVE;   break;
-    case BTN_MODE_RENAME: m_mode = OpMode::RENAME; m_renameInputActive = true; break;
-    case BTN_MODE_DELETE: m_mode = OpMode::DELETE; break;
-    case BTN_MODE_DEDUPE: m_mode = OpMode::DEDUPE; break;
-    case BTN_MODE_SYNC:   m_mode = OpMode::SYNC;   break;
+    case BTN_MODE_COPY:   m_mode = OpMode::COPY;   m_renameInputActive = false; break;
+    case BTN_MODE_MOVE:   m_mode = OpMode::MOVE;   m_renameInputActive = false; break;
+    case BTN_MODE_RENAME: m_mode = OpMode::RENAME; m_renameInputActive = true;  break;
+    case BTN_MODE_DELETE: m_mode = OpMode::DEL;    m_renameInputActive = false; break;
+    case BTN_MODE_DEDUPE: m_mode = OpMode::DEDUPE; m_renameInputActive = false; break;
+    case BTN_MODE_SYNC:   m_mode = OpMode::SYNC;   m_renameInputActive = false; break;
 
     case BTN_ADD_FILES:  PickSourceFiles(false); break;
     case BTN_ADD_FOLDER: PickSourceFiles(true);  break;
     case BTN_CLEAR_SRC:  m_sources.clear();      break;
     case BTN_PICK_DEST:  PickDestination();       break;
 
-    case BTN_OPT_OVERWRITE: m_buttons[BTN_OPT_OVERWRITE].active ^= 1; m_optOverwrite = m_buttons[BTN_OPT_OVERWRITE].active; break;
-    case BTN_OPT_VERIFY:    m_buttons[BTN_OPT_VERIFY].active    ^= 1; m_optVerify    = m_buttons[BTN_OPT_VERIFY].active;    break;
-    case BTN_OPT_PRESERVE:  m_buttons[BTN_OPT_PRESERVE].active  ^= 1; m_optPreserve  = m_buttons[BTN_OPT_PRESERVE].active;  break;
+    case BTN_OPT_OVERWRITE:
+        m_buttons[BTN_OPT_OVERWRITE].active = !m_buttons[BTN_OPT_OVERWRITE].active;
+        m_optOverwrite = m_buttons[BTN_OPT_OVERWRITE].active;
+        break;
+    case BTN_OPT_VERIFY:
+        m_buttons[BTN_OPT_VERIFY].active = !m_buttons[BTN_OPT_VERIFY].active;
+        m_optVerify = m_buttons[BTN_OPT_VERIFY].active;
+        break;
+    case BTN_OPT_PRESERVE:
+        m_buttons[BTN_OPT_PRESERVE].active = !m_buttons[BTN_OPT_PRESERVE].active;
+        m_optPreserve = m_buttons[BTN_OPT_PRESERVE].active;
+        break;
     case BTN_OPT_THREADS:
         m_threadCount = (m_threadCount % 8) + 1;
         break;
@@ -1200,7 +1007,6 @@ void TitanShiftApp::OnButtonClick(BtnID id) {
 }
 
 void TitanShiftApp::PickSourceFiles(bool folders) {
-    // Use IFileOpenDialog for modern multi-select
     IFileOpenDialog* dlg = nullptr;
     if (FAILED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_ALL,
         IID_IFileOpenDialog, (void**)&dlg))) return;
@@ -1222,9 +1028,9 @@ void TitanShiftApp::PickSourceFiles(bool folders) {
                         WIN32_FILE_ATTRIBUTE_DATA info{};
                         if (GetFileAttributesExW(path, GetFileExInfoStandard, &info)) {
                             FileEntry e;
-                            e.path     = path;
-                            e.name     = PathFindFileNameW(path);
-                            e.isDir    = (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+                            e.path  = path;
+                            e.name  = PathFindFileNameW(path);
+                            e.isDir = (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
                             ULARGE_INTEGER sz;
                             sz.LowPart  = info.nFileSizeLow;
                             sz.HighPart = info.nFileSizeHigh;
@@ -1262,44 +1068,42 @@ void TitanShiftApp::PickDestination() {
     dlg->Release();
 }
 
-static std::atomic<bool> s_cancel{false};
-static std::atomic<bool> s_pause{false};
-static OpStats s_stats;
-
 void TitanShiftApp::StartOperation() {
-    if (m_sources.empty()) { PostLog(LogLevel::WARN, L"No source files."); return; }
+    if (m_sources.empty()) {
+        PostLog(LogLevel::WARN, L"No source files."); return;
+    }
     if ((m_mode == OpMode::COPY || m_mode == OpMode::MOVE || m_mode == OpMode::SYNC)
         && m_dest.empty()) {
         PostLog(LogLevel::WARN, L"No destination selected."); return;
     }
 
-    // Reset state
     s_cancel = false;
     s_pause  = false;
-    s_stats  = OpStats{};
+    s_stats.reset();
     s_stats.startTick = GetTickCount64();
-    m_opState = OpState::SCANNING;
-    m_lastProgress = {};
 
-    // Copy needed data for thread
+    m_opState = OpState::SCANNING;
+    m_lastProgress = ProgressPayload{};
+    m_lastProgress.state = OpState::SCANNING;
+
     std::vector<FileEntry> srcCopy = m_sources;
-    std::wstring destCopy = m_dest;
-    std::wstring renamePat = m_renameInput;
-    OpMode mode = m_mode;
+    std::wstring  destCopy  = m_dest;
+    std::wstring  renamePat = m_renameInput;
+    OpMode        mode      = m_mode;
     CopyOptions opts;
-    opts.overwrite = m_optOverwrite;
-    opts.verify    = m_optVerify;
+    opts.overwrite          = m_optOverwrite;
+    opts.verify             = m_optVerify;
     opts.preserveTimestamps = m_optPreserve;
-    opts.threadCount = m_threadCount;
+    opts.threadCount        = m_threadCount;
 
     UpdateButtonLayout();
+    InvalidateRect(m_hwnd, nullptr, FALSE);
 
     if (m_workerThread.joinable()) m_workerThread.join();
 
     m_workerThread = std::thread([this, srcCopy, destCopy, renamePat, mode, opts]() {
         PostLog(LogLevel::INFO, L"Scanning files…");
 
-        // Expand directories to file list
         std::vector<std::wstring> roots;
         for (const auto& e : srcCopy) roots.push_back(e.path);
         std::vector<FileEntry> allFiles = FileEngine::ScanPaths(roots, &s_cancel);
@@ -1315,25 +1119,34 @@ void TitanShiftApp::StartOperation() {
         s_stats.totalBytes = FileEngine::TotalSize(allFiles);
 
         wchar_t buf[128];
-        swprintf_s(buf, L"Found %llu files (%s)",
-            s_stats.totalFiles.load(),
+        swprintf(buf, 128, L"Found %llu files (%s)",
+            (unsigned long long)s_stats.totalFiles.load(),
             FormatBytes(s_stats.totalBytes.load()).c_str());
         PostLog(LogLevel::INFO, buf);
 
         m_opState = OpState::RUNNING;
+        ProgressPayload pp{};
+        pp.totalFiles = s_stats.totalFiles.load();
+        pp.totalBytes = s_stats.totalBytes.load();
+        pp.state = OpState::RUNNING;
+        PostProgress(pp);
 
         FileEngine engine(this, &s_stats, &s_cancel, &s_pause);
         switch (mode) {
         case OpMode::COPY:   engine.Copy(allFiles,   destCopy, opts); break;
         case OpMode::MOVE:   engine.Move(allFiles,   destCopy, opts); break;
         case OpMode::RENAME: engine.Rename(allFiles, renamePat);       break;
-        case OpMode::DELETE: engine.Delete(allFiles);                   break;
+        case OpMode::DEL:    engine.Delete(allFiles);                   break;
         case OpMode::DEDUPE: engine.Dedupe(allFiles, destCopy);         break;
         case OpMode::SYNC:   engine.Sync(allFiles,   destCopy, opts);   break;
         }
 
-        if (!s_cancel.load()) PostComplete();
-        else { m_opState = OpState::CANCELLED; PostMessageW(m_hwnd, WM_PROGRESS_UPDATE, 0, 0); }
+        if (!s_cancel.load()) {
+            PostComplete();
+        } else {
+            m_opState = OpState::CANCELLED;
+            PostMessageW(m_hwnd, WM_PROGRESS_UPDATE, 0, 0);
+        }
     });
 }
 
@@ -1361,26 +1174,26 @@ std::wstring TitanShiftApp::FormatBytes(ULONGLONG bytes) {
     double d = (double)bytes;
     while (d >= 1024.0 && i < 5) { d /= 1024.0; i++; }
     wchar_t buf[32];
-    swprintf_s(buf, L"%.1f %s", d, units[i]);
+    swprintf(buf, 32, L"%.1f %s", d, units[i]);
     return buf;
-}
-
-std::wstring TitanShiftApp::FormatSpeed(ULONGLONG bps) {
-    return FormatBytes(bps) + L"/s";
 }
 
 std::wstring TitanShiftApp::FormatETA(ULONGLONG secs) {
     if (secs == 0) return L"—";
     wchar_t buf[32];
-    if (secs < 60)        swprintf_s(buf, L"%llus", secs);
-    else if (secs < 3600) swprintf_s(buf, L"%llum %llus", secs/60, secs%60);
-    else                  swprintf_s(buf, L"%lluh %llum", secs/3600, (secs%3600)/60);
+    if (secs < 60)
+        swprintf(buf, 32, L"%llus", (unsigned long long)secs);
+    else if (secs < 3600)
+        swprintf(buf, 32, L"%llum %llus", (unsigned long long)(secs/60), (unsigned long long)(secs%60));
+    else
+        swprintf(buf, 32, L"%lluh %llum",
+            (unsigned long long)(secs/3600), (unsigned long long)((secs%3600)/60));
     return buf;
 }
 
 std::wstring TitanShiftApp::FormatTime() {
     SYSTEMTIME st; GetLocalTime(&st);
     wchar_t buf[16];
-    swprintf_s(buf, L"%02d:%02d:%02d", st.wHour, st.wMinute, st.wSecond);
+    swprintf(buf, 16, L"%02d:%02d:%02d", st.wHour, st.wMinute, st.wSecond);
     return buf;
 }

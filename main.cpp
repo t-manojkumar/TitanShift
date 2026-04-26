@@ -1,79 +1,44 @@
 /*
  * TitanShift Native - High-Performance Bulk File Operations
  * Pure Win32 + Direct2D + Windows kernel APIs
- * No frameworks. No overhead. Direct OS calls only.
  */
-
-#define WIN32_LEAN_AND_MEAN
-#define NOMINMAX
-#define UNICODE
-#define _UNICODE
-
-#include <windows.h>
-#include <windowsx.h>
-#include <commctrl.h>
-#include <shellapi.h>
-#include <shlobj.h>
-#include <shlwapi.h>
-#include <d2d1.h>
-#include <dwrite.h>
-#include <winternl.h>
-#include <psapi.h>
-#include <pdh.h>
-#include <setupapi.h>
-#include <devguid.h>
-#include <cfgmgr32.h>
-
-#include <string>
-#include <vector>
-#include <thread>
-#include <atomic>
-#include <mutex>
-#include <queue>
-#include <filesystem>
-#include <chrono>
-#include <functional>
-#include <memory>
-#include <algorithm>
-#include <numeric>
-#include <sstream>
-#include <iomanip>
-#include <fstream>
-
-#pragma comment(lib, "d2d1.lib")
-#pragma comment(lib, "dwrite.lib")
-#pragma comment(lib, "comctl32.lib")
-#pragma comment(lib, "shlwapi.lib")
-#pragma comment(lib, "shell32.lib")
-#pragma comment(lib, "pdh.lib")
-#pragma comment(lib, "psapi.lib")
-#pragma comment(lib, "ntdll.lib")
-
 #include "TitanShift.h"
 #include "FileEngine.h"
 #include "MetricsEngine.h"
+#include <commctrl.h>
 
+// DPI_AWARENESS_CONTEXT is defined in modern <windef.h> via DECLARE_HANDLE.
+// We just need the V2 constant if missing.
+#ifndef DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2
+#define DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 ((DPI_AWARENESS_CONTEXT)-4)
+#endif
 
+typedef BOOL (WINAPI *PFN_SetProcessDpiAwarenessContext)(DPI_AWARENESS_CONTEXT);
 
-// Global application instance
-TitanShiftApp* g_App = nullptr;
+// Use ANSI WinMain entry — works with both MSVC (default) and MinGW (default).
+// Wide character support is unaffected because we use *W APIs throughout.
+int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
+    // Try to enable Per-Monitor DPI v2 (Windows 10 1703+) — load dynamically
+    HMODULE user32 = GetModuleHandleW(L"user32.dll");
+    if (user32) {
+        auto fn = (PFN_SetProcessDpiAwarenessContext)
+            GetProcAddress(user32, "SetProcessDpiAwarenessContext");
+        if (fn) {
+            fn(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+        } else {
+            SetProcessDPIAware(); // fallback for older Windows
+        }
+    }
 
-int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR lpCmdLine, int nCmdShow) {
-    // Enable high-DPI awareness
-    SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
-
-    // Initialize COM
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
 
-    // Initialize common controls
     INITCOMMONCONTROLSEX icc = { sizeof(icc), ICC_WIN95_CLASSES | ICC_STANDARD_CLASSES };
     InitCommonControlsEx(&icc);
 
-    // Create and run application
-    g_App = new TitanShiftApp(hInstance);
-    int result = g_App->Run(nCmdShow);
+    TitanShiftApp* app = new TitanShiftApp(hInstance);
+    int result = app->Run(nCmdShow);
+    delete app;
 
-    delete g_App;
     CoUninitialize();
     return result;
 }

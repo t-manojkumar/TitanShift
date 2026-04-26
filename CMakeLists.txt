@@ -1,20 +1,21 @@
 cmake_minimum_required(VERSION 3.20)
-project(TitanShift VERSION 2.0 LANGUAGES CXX)
+project(TitanShift VERSION 2.0 LANGUAGES CXX RC)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 if(MINGW)
-    add_compile_options(-O2 -Wall -Wno-unused-variable)
+    add_compile_options(-O2 -Wall -Wno-unused-variable -Wno-unused-parameter
+                        -Wno-unused-but-set-variable -Wno-unknown-pragmas)
+    # Subsystem WINDOWS = no console; static link for portability
     add_link_options(-mwindows -static -static-libgcc -static-libstdc++)
 endif()
 
 if(MSVC)
-    add_compile_options(/O2 /GL /W3 /WX- /MP)
+    add_compile_options(/O2 /GL /W3 /WX- /MP /utf-8)
     add_link_options(/LTCG /OPT:REF /SUBSYSTEM:WINDOWS)
 endif()
 
-# All files are flat in the same directory
 set(SOURCES
     main.cpp
     TitanShiftApp.cpp
@@ -37,4 +38,7 @@ target_link_libraries(TitanShift PRIVATE
     oleaut32
     uuid
     dwmapi
+    user32
+    gdi32
+    kernel32
 )
